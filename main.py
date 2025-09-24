@@ -12,13 +12,15 @@ This module exposes a FastAPI application with two endpoints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import email
+from email import policy
 from email.message import EmailMessage
 from email.utils import make_msgid
 import imaplib
 import json
 import smtplib
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence, Union
 import urllib.error
 import urllib.request
 
@@ -68,11 +70,34 @@ class EmailContent(BaseModel):
     html_body: Optional[str] = Field(None, description="HTML body (optional)")
     reply_to: Optional[List[EmailStr]] = Field(None, description="Reply-To header")
 
-    @validator("to")
-    def validate_to(cls, value: List[EmailStr]) -> List[EmailStr]:
-        if not value:
+    @staticmethod
+    def _normalize_addresses(
+        value: Union[None, EmailStr, Sequence[EmailStr], str]
+    ) -> Optional[List[EmailStr]]:
+        if value in (None, ""):
+            return None
+
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",") if item.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = [value]
+
+        return items or None
+
+    @validator("to", pre=True)
+    def validate_to(cls, value: Union[str, Sequence[str]]) -> List[EmailStr]:
+        normalized = cls._normalize_addresses(value) or []
+        if not normalized:
             raise ValueError("at least one recipient must be provided in 'to'")
-        return value
+        return normalized
+
+    @validator("cc", "bcc", "reply_to", pre=True)
+    def validate_optional_recipients(
+        cls, value: Union[str, Sequence[str]]
+    ) -> Optional[List[EmailStr]]:
+        return cls._normalize_addresses(value)
 
 
 class EmailRequest(BaseModel):
@@ -127,6 +152,10 @@ def _prepare_email_message(content: EmailContent) -> EmailMessage:
     return message
 
 
+def _open_smtp_connection(config: SMTPSettings) -> smtplib.SMTP:
+    smtp_class = smtplib.SMTP_SSL if config.use_ssl else smtplib.SMTP
+    return smtp_class(config.host, config.port, timeout=10)
+
 def _send_email(request: EmailRequest) -> str:
     message = _prepare_email_message(request.mail)
     recipients = (
@@ -141,23 +170,21 @@ def _send_email(request: EmailRequest) -> str:
     smtp_config = request.smtp
 
     try:
-        if smtp_config.use_ssl:
-            server = smtplib.SMTP_SSL(smtp_config.host, smtp_config.port)
-        else:
-            server = smtplib.SMTP(smtp_config.host, smtp_config.port)
-        server.ehlo()
-
-        if smtp_config.use_tls and not smtp_config.use_ssl:
-            server.starttls()
+        with _open_smtp_connection(smtp_config) as server:
             server.ehlo()
 
-        if smtp_config.username and smtp_config.password:
-            server.login(smtp_config.username, smtp_config.password)
+            if smtp_config.use_tls and not smtp_config.use_ssl:
+                server.starttls()
+                server.ehlo()
 
-        server.send_message(message, from_addr=request.mail.sender, to_addrs=recipients)
-        server.quit()
+            if smtp_config.username and smtp_config.password:
+                server.login(smtp_config.username, smtp_config.password)
+
+            server.send_message(
+                message, from_addr=request.mail.sender, to_addrs=recipients
+            )
         return message["Message-ID"]
-    except smtplib.SMTPException as exc:  # pragma: no cover - dependent on runtime
+    except (smtplib.SMTPException, OSError) as exc:  # pragma: no cover - runtime dependent
         raise HTTPException(status_code=502, detail=f"SMTP error: {exc}") from exc
 
 
@@ -177,34 +204,47 @@ def _post_webhook(url: str, payload: dict) -> None:
         raise HTTPException(status_code=502, detail=f"Webhook request failed: {exc}") from exc
 
 
-def _fetch_imap_messages(settings: IMAPSettings, mailbox: str, criteria: str) -> List[tuple[str, EmailMessage]]:
+def _fetch_imap_messages(
+    settings: IMAPSettings, mailbox: str, criteria: str
+) -> List[tuple[str, EmailMessage]]:
     if settings.use_ssl:
         client = imaplib.IMAP4_SSL(settings.host, settings.port)
     else:
         client = imaplib.IMAP4(settings.host, settings.port)
 
-    try:
-        client.login(settings.username, settings.password)
-        client.select(mailbox)
-        status, data = client.search(None, criteria)
-        if status != "OK":
-            raise HTTPException(status_code=502, detail=f"IMAP search failed: {status}")
+    with contextlib.ExitStack() as stack:
+        stack.callback(lambda: _safe_imap_logout(client))
 
-        message_ids = data[0].split()
-        messages: List[tuple[str, EmailMessage]] = []
-        for message_id in message_ids:
-            status, fetched = client.fetch(message_id, "(RFC822)")
-            if status != "OK" or not fetched:
-                continue
-            raw_email = fetched[0][1]
-            email_message = email.message_from_bytes(raw_email)
-            messages.append((message_id.decode("utf-8"), email_message))
-        return messages
-    finally:
         try:
-            client.logout()
-        except imaplib.IMAP4.error:
-            pass
+            client.login(settings.username, settings.password)
+            client.select(mailbox)
+            status, data = client.search(None, criteria)
+            if status != "OK":
+                raise HTTPException(
+                    status_code=502, detail=f"IMAP search failed: {status}"
+                )
+
+            message_ids = data[0].split()
+            messages: List[tuple[str, EmailMessage]] = []
+            for message_id in message_ids:
+                status, fetched = client.fetch(message_id, "(RFC822)")
+                if status != "OK" or not fetched:
+                    continue
+                raw_email = fetched[0][1]
+                email_message = email.message_from_bytes(
+                    raw_email, policy=policy.default
+                )
+                messages.append((message_id.decode("utf-8"), email_message))
+            return messages
+        except imaplib.IMAP4.error as exc:  # pragma: no cover - runtime dependent
+            raise HTTPException(status_code=502, detail=f"IMAP error: {exc}") from exc
+
+
+def _safe_imap_logout(client: imaplib.IMAP4) -> None:
+    try:
+        client.logout()
+    except imaplib.IMAP4.error:
+        pass
 
 
 @app.post("/smtp")
