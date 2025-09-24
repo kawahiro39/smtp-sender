@@ -18,6 +18,7 @@ from email import policy
 from email.message import EmailMessage
 from email.utils import make_msgid
 import imaplib
+import ssl
 import json
 import smtplib
 from typing import Iterable, List, Optional, Sequence, Union
@@ -68,6 +69,9 @@ class SMTPSettings(BaseModel):
     use_ssl: bool = Field(
         False, description="Use SMTP over SSL (SMTPS). Overrides use_tls when true."
     )
+    timeout: float = Field(
+        10.0, description="Timeout in seconds for SMTP operations (default 10 seconds)"
+    )
 
     @validator("port")
     def validate_port(cls, value: int) -> int:
@@ -75,6 +79,11 @@ class SMTPSettings(BaseModel):
             raise ValueError("port must be between 1 and 65535")
         return value
 
+    @validator("timeout")
+    def validate_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("timeout must be greater than 0")
+        return value
 
 def _ensure_list(value: Optional[Iterable[str]]) -> List[str]:
     if value is None:
@@ -102,9 +111,13 @@ class EmailContent(BaseModel):
         if isinstance(value, str):
             items = [item.strip() for item in value.split(",") if item.strip()]
         elif isinstance(value, (list, tuple, set)):
-            items = list(value)
+            items = [
+                str(item).strip()
+                for item in value
+                if isinstance(item, (str, EmailStr)) and str(item).strip()
+            ]
         else:
-            items = [value]
+            items = [str(value).strip()]
 
         return items or None
 
@@ -176,7 +189,7 @@ def _prepare_email_message(content: EmailContent) -> EmailMessage:
 
 def _open_smtp_connection(config: SMTPSettings) -> smtplib.SMTP:
     smtp_class = smtplib.SMTP_SSL if config.use_ssl else smtplib.SMTP
-    return smtp_class(config.host, config.port, timeout=10)
+    return smtp_class(config.host, config.port, timeout=config.timeout)
 
 
 def _send_email(request: EmailRequest) -> str:
@@ -197,7 +210,16 @@ def _send_email(request: EmailRequest) -> str:
             server.ehlo()
 
             if smtp_config.use_tls and not smtp_config.use_ssl:
-                server.starttls()
+                if "starttls" not in getattr(server, "esmtp_features", {}):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "SMTP server does not advertise STARTTLS. "
+                            "Set use_tls to false or enable TLS on the server."
+                        ),
+                    )
+                tls_context = ssl.create_default_context()
+                server.starttls(context=tls_context)
                 server.ehlo()
 
             if smtp_config.username and smtp_config.password:
@@ -207,6 +229,13 @@ def _send_email(request: EmailRequest) -> str:
                 message, from_addr=request.mail.sender, to_addrs=recipients
             )
         return message["Message-ID"]
+    except smtplib.SMTPAuthenticationError as exc:  # pragma: no cover - runtime dependent
+        raise HTTPException(
+            status_code=401,
+            detail=f"SMTP authentication failed: {exc.smtp_error.decode(errors='ignore') if isinstance(exc.smtp_error, bytes) else exc.smtp_error}",
+        ) from exc
+    except smtplib.SMTPNotSupportedError as exc:  # pragma: no cover - runtime dependent
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (smtplib.SMTPException, OSError) as exc:  # pragma: no cover - runtime dependent
         raise HTTPException(status_code=502, detail=f"SMTP error: {exc}") from exc
 
