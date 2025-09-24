@@ -156,6 +156,7 @@ def _open_smtp_connection(config: SMTPSettings) -> smtplib.SMTP:
     smtp_class = smtplib.SMTP_SSL if config.use_ssl else smtplib.SMTP
     return smtp_class(config.host, config.port, timeout=10)
 
+
 def _send_email(request: EmailRequest) -> str:
     message = _prepare_email_message(request.mail)
     recipients = (
