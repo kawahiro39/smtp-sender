@@ -53,7 +53,6 @@ async def handle_request_validation(
 
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-
 class SMTPSettings(BaseModel):
     host: str = Field(..., description="SMTP server hostname")
     port: int = Field(..., description="SMTP server port")
