@@ -54,7 +54,6 @@ async def handle_request_validation(
 
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-
 class SMTPSettings(BaseModel):
     host: str = Field(..., description="SMTP server hostname")
     port: int = Field(..., description="SMTP server port")
@@ -85,7 +84,6 @@ class SMTPSettings(BaseModel):
         if value <= 0:
             raise ValueError("timeout must be greater than 0")
         return value
-
 
 def _ensure_list(value: Optional[Iterable[str]]) -> List[str]:
     if value is None:
