@@ -24,12 +24,34 @@ from typing import Iterable, List, Optional, Sequence, Union
 import urllib.error
 import urllib.request
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, EmailStr, Field, validator
 
 
 app = FastAPI(title="SMTP Sender", version="1.0.0")
 
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Return clearer messaging when the JSON payload cannot be parsed."""
+
+    json_errors = [error for error in exc.errors() if error.get("type") == "json_invalid"]
+    if json_errors:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": (
+                    "Invalid JSON payload. Ensure the body is valid JSON with double-quoted "
+                    "property names and matches the documented schema."
+                )
+            },
+        )
+
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 class SMTPSettings(BaseModel):
     host: str = Field(..., description="SMTP server hostname")
